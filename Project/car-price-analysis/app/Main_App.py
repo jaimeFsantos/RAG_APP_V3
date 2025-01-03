@@ -25,6 +25,8 @@ import pytz
 import time
 from datetime import timedelta
 from sklearn.model_selection import train_test_split
+import gc
+import psutil
 
 # Third-Party Libraries
 import streamlit as st
@@ -76,6 +78,10 @@ class CombinedCarApp:
             from storage_service import get_storage_service
             self.storage_service = get_storage_service()
             
+            self.memory_threshold = 700 * 1024 * 1024  # 700MB in bytes
+            
+            # Add memory monitoring
+            self.monitor_resources()
             # Initialize security manager
             is_ec2 = os.getenv('AWS_EXECUTION_ENV', '').startswith('AWS_ECS')
             mode = SecurityMode.EC2 if is_ec2 else SecurityMode.LOCAL
@@ -92,6 +98,82 @@ class CombinedCarApp:
         except Exception as e:
             logger.error(f"Initialization error: {e}", exc_info=True)
             st.error(f"Error initializing app: {str(e)}")
+            
+            
+            
+    def reduce_workload(self):
+        """Reduce processing workload when resources are constrained"""
+        try:
+            # Adjust batch sizes dynamically
+            if hasattr(self, 'batch_size'):
+                self.batch_size = max(100, self.batch_size // 2)  # Reduce but don't go below 100
+
+            # Clear unnecessary caches
+            if hasattr(st, 'cache_data'):
+                st.cache_data.clear()
+
+            # If predictor exists, reduce its workload
+            if hasattr(st.session_state, 'predictor') and st.session_state.predictor:
+                if not hasattr(st.session_state.predictor, 'fast_mode'):
+                    st.session_state.predictor.fast_mode = True
+                if hasattr(st.session_state.predictor, 'max_samples'):
+                    st.session_state.predictor.max_samples = min(
+                        st.session_state.predictor.max_samples, 
+                        1000
+                    )
+
+            # If QA system exists, reduce its memory usage
+            if hasattr(st.session_state, 'qa_system') and st.session_state.qa_system:
+                if hasattr(st.session_state.qa_system, 'chunk_size'):
+                    st.session_state.qa_system.chunk_size = min(
+                        st.session_state.qa_system.chunk_size,
+                        500
+                    )
+
+            # Force garbage collection
+            gc.collect()
+
+            logger.info("Workload reduced due to resource constraints")
+
+        except Exception as e:
+            logger.error(f"Error reducing workload: {e}")
+            
+            
+            
+    def monitor_resources(self):
+        """Monitor and optimize resource usage"""
+        try:
+            memory_used = psutil.Process().memory_info().rss
+            if memory_used > self.memory_threshold:
+                # Force garbage collection
+                gc.collect()
+                # Clear cache if exists
+                if hasattr(st, 'cache_data'):
+                    st.cache_data.clear()
+                logger.warning(f"Memory usage high: {memory_used/1024/1024:.2f}MB")
+                
+            # Monitor CPU usage
+            cpu_percent = psutil.cpu_percent()
+            if cpu_percent > 70:  # High CPU usage threshold
+                logger.warning(f"High CPU usage: {cpu_percent}%")
+                # Reduce batch sizes or processing
+                self.reduce_workload()
+                
+            # Log current resource status
+            logger.info(f"Memory: {memory_used/1024/1024:.2f}MB, CPU: {cpu_percent}%")
+            
+        except Exception as e:
+            logger.error(f"Error monitoring resources: {e}")
+            # Don't raise the error - we want the app to continue running
+            # but log it for debugging
+            if hasattr(self, 'failures_count'):
+                self.failures_count += 1
+                if self.failures_count > 5:
+                    # After 5 failures, try to reset the monitoring
+                    self.failures_count = 0
+                    self.memory_threshold = 700 * 1024 * 1024  # Reset to default
+            else:
+                self.failures_count = 1
             
     
     def _initialize_session_state(self):
@@ -201,7 +283,7 @@ class CombinedCarApp:
             max_retries = 3
             for attempt in range(max_retries):
                 try:
-                    qa_system = EnhancedQASystem(chunk_size=500, chunk_overlap=25)  # Reduced chunk size for EC2
+                    qa_system = EnhancedQASystem(chunk_size=300, chunk_overlap=25)  # Reduced chunk size for EC2
                     chain = qa_system.create_chain(sources)
                     
                     if chain is None:
@@ -512,7 +594,10 @@ class CombinedCarApp:
         except Exception as e:
             logger.error(f"Error in price predictor: {e}")
             st.error("An error occurred. Please try again.")
-
+            
+            
+            
+    @st.cache_data(ttl=3600)  # Cache for 1 hour
     def _prepare_predictor_data(self, df: pd.DataFrame) -> pd.DataFrame:
         """Prepare data for prediction with proper error handling"""
         categorical_columns = [
@@ -762,8 +847,25 @@ class CombinedCarApp:
             st.empty()  # Placeholder for visualizations that will be updated
             
             
+    def cleanup_resources(self):
+        """Cleanup resources periodically"""
+        try:
+            # Clear unnecessary session state data
+            keys_to_keep = {'authenticated', 'last_activity', 'session_id'}
+            for key in list(st.session_state.keys()):
+                if key not in keys_to_keep:
+                    del st.session_state[key]
+            
+            # Force garbage collection
+            gc.collect()
+            
+        except Exception as e:
+            logger.error(f"Error cleaning resources: {e}")
+            
+    @st.cache_data(ttl=1800)  # Cache for 30 minutes
     def _render_chat_messages(self):
         """Render chat message history and input"""
+        messages = st.session_state.messages[-10:]  # Show only last 10 messages
         # Display existing messages
         for message in st.session_state.messages:
             with st.chat_message(message["role"]):
